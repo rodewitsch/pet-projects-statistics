@@ -32,7 +32,8 @@ async function main(args) {
         };
 
     } catch (error) {
-        console.error('Error:', error.message);
+        const verbose = error && error.stack ? `${error.message}\n${error.stack}` : String(error);
+        console.error('Error:', verbose);
         
         try {
             await sendTelegramMessageSimple(
@@ -79,8 +80,113 @@ function formatMinskDateDisplay(date) {
     return `${day}.${month}.${year}`;
 }
 
+const https = require('https');
+const http = require('http');
+
+const FETCH_TIMEOUT_MS = 10000;   // per attempt
+const FETCH_MAX_RETRIES = 3;      // total attempts
+
+const RETRYABLE_STATUS = [408, 425, 429, 500, 502, 503, 504];
+
+function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Minimal fetch-compatible response built on the Node http/https modules.
+// Using the built-in modules instead of undici's global fetch() is far more
+// reliable inside the DigitalOcean Functions sandbox and yields precise
+// error codes (ENOTFOUND, ECONNREFUSED, ECONNRESET, CERT_HAS_EXPIRED, ...)
+// instead of a bare 'TypeError: fetch failed'.
+async function httpsFetch(url, options = {}) {
+    const u = new URL(url);
+    const transport = u.protocol === 'http:' ? http : https;
+
+    const headers = { ...(options.headers || {}) };
+
+    let bodyBuffer = null;
+    if (options.body) {
+        bodyBuffer = Buffer.isBuffer(options.body) ? options.body : Buffer.from(options.body);
+        headers['content-length'] = bodyBuffer.length;
+    }
+
+    return new Promise((resolve, reject) => {
+        const req = transport.request(
+            {
+                method: options.method || 'GET',
+                hostname: u.hostname,
+                port: u.port || (u.protocol === 'http:' ? 80 : 443),
+                path: u.pathname + u.search,
+                headers,
+                rejectUnauthorized: true
+            },
+            (res) => {
+                let chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => {
+                    const text = Buffer.concat(chunks).toString('utf8');
+                    resolve({
+                        ok: res.statusCode >= 200 && res.statusCode < 300,
+                        status: res.statusCode,
+                        statusText: res.statusMessage,
+                        async json() {
+                            try { return JSON.parse(text); }
+                            catch (e) { throw new Error(`Invalid JSON from ${url}: ${text.slice(0,200)}`); }
+                        },
+                        async text() { return text; }
+                    });
+                });
+            }
+        );
+
+        req.setTimeout(FETCH_TIMEOUT_MS, () => {
+            req.destroy(new Error(`Request timeout (${FETCH_TIMEOUT_MS}ms) for ${u.hostname}`));
+        });
+
+        req.on('error', (err) => {
+            reject(err);
+        });
+
+        if (bodyBuffer) req.write(bodyBuffer);
+        req.end();
+    });
+}
+
+/**
+ * fetch() with timeout + retry on transient failures.
+ * Logs the failing URL and underlying cause, so 'fetch failed' is never silent.
+ */
+async function fetchWithRetry(url, options = {}) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= FETCH_MAX_RETRIES; attempt++) {
+        try {
+            const res = await httpsFetch(url, options);
+
+            // Retry on transient server status codes too
+            if (RETRYABLE_STATUS.includes(res.status) && attempt < FETCH_MAX_RETRIES) {
+                console.error(`Retryable status ${res.status} for ${url} (attempt ${attempt}/${FETCH_MAX_RETRIES})`);
+                await delay(500 * attempt);
+                continue;
+            }
+
+            return res;
+        } catch (e) {
+            lastError = e;
+            console.error(
+                `fetch failed for ${url} (attempt ${attempt}/${FETCH_MAX_RETRIES}): ${e.name || 'Error'}: ${e.message}`
+            );
+
+            if (attempt < FETCH_MAX_RETRIES) {
+                await delay(500 * attempt);
+            }
+        }
+    }
+
+    throw lastError;
+}
+
 async function getAuthorizationCode(email, password) {
-    const response = await fetch(
+    const response = await fetchWithRetry(
         `https://api-user.huami.com/registrations/${encodeURIComponent(email)}/tokens`,
         {
             method: 'POST',
@@ -112,7 +218,7 @@ async function getAuthorizationCode(email, password) {
 }
 
 async function getAccessToken(authCode) {
-    const response = await fetch('https://account.huami.com/v2/client/login', {
+    const response = await fetchWithRetry('https://account.huami.com/v2/client/login', {
         method: 'POST',
         headers: {
             'accept': 'application/json, text/plain, */*',
@@ -143,7 +249,7 @@ async function getAccessToken(authCode) {
 async function getStatistics(appToken, userId, startTime, endTime) {
     const url = `https://api-mifit-cn3.zepp.com/market/open/statistics?userid=${userId}&page=1&per_page=50&type=4&start_time=${startTime}&end_time=${endTime}`;
     
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
         method: 'GET',
         headers: {
             'accept': 'application/json, text/plain, */*',
@@ -253,7 +359,7 @@ function formatNumber(num) {
 
 async function sendTelegramMessage(botToken, chatId, text) {
     try {
-        const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${botToken}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -284,7 +390,7 @@ async function sendTelegramMessageSimple(botToken, chatId, text) {
         .replace(/\\/g, '')
         .replace(/[_\[\]()~>#+\-=|{}.!]/g, '');
     
-    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    const response = await fetchWithRetry(`https://api.telegram.org/bot${botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
