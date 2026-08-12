@@ -156,15 +156,16 @@ async function httpsFetch(url, options = {}) {
  * Logs the failing URL and underlying cause, so 'fetch failed' is never silent.
  */
 async function fetchWithRetry(url, options = {}) {
+    const maxRetries = options.maxRetries || FETCH_MAX_RETRIES;
     let lastError;
 
-    for (let attempt = 1; attempt <= FETCH_MAX_RETRIES; attempt++) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             const res = await httpsFetch(url, options);
 
             // Retry on transient server status codes too
-            if (RETRYABLE_STATUS.includes(res.status) && attempt < FETCH_MAX_RETRIES) {
-                console.error(`Retryable status ${res.status} for ${url} (attempt ${attempt}/${FETCH_MAX_RETRIES})`);
+            if (RETRYABLE_STATUS.includes(res.status) && attempt < maxRetries) {
+                console.error(`Retryable status ${res.status} for ${url} (attempt ${attempt}/${maxRetries})`);
                 await delay(500 * attempt);
                 continue;
             }
@@ -173,10 +174,10 @@ async function fetchWithRetry(url, options = {}) {
         } catch (e) {
             lastError = e;
             console.error(
-                `fetch failed for ${url} (attempt ${attempt}/${FETCH_MAX_RETRIES}): ${e.name || 'Error'}: ${e.message}`
+                `fetch failed for ${url} (attempt ${attempt}/${maxRetries}): ${e.name || 'Error'}: ${e.message}`
             );
 
-            if (attempt < FETCH_MAX_RETRIES) {
+            if (attempt < maxRetries) {
                 await delay(500 * attempt);
             }
         }
@@ -246,17 +247,21 @@ async function getAccessToken(authCode) {
     return data.token_info.app_token;
 }
 
-// Region hosts for the Zepp market/statistics API. -cn3 (China) is primary
-// because the account historically served from there, but egress from the
-// DigitalOcean sandbox to Chinese hosts is flaky/geo-blocked at times, so we
-// fall back across the regional hosts until one responds.
+// Region hosts for the Zepp market/statistics API. The account serves data on
+// the US/international host, and egress from the DigitalOcean sandbox to the
+// China (-cn*) hosts times out at the TCP level, so the non-China hosts go
+// first and the China hosts stay as a fallback.
 const STATISTICS_HOSTS = [
+    'api-mifit-us.zepp.com',
+    'api-mifit.zepp.com',
     'api-mifit-cn3.zepp.com',
     'api-mifit-cn.zepp.com',
-    'api-mifit-cn2.zepp.com',
-    'api-mifit-us.zepp.com',
-    'api-mifit.zepp.com'
+    'api-mifit-cn2.zepp.com'
 ];
+
+// Statistics host is already the primary data source; keep per-host calls fast
+// so a stack of dead hosts doesn't burn the whole 60s function budget.
+const STATS_ATTEMPTS = 2;
 
 async function getStatistics(appToken, userId, startTime, endTime) {
     const path = `/market/open/statistics?userid=${userId}&page=1&per_page=50&type=4&start_time=${startTime}&end_time=${endTime}`;
@@ -270,11 +275,17 @@ async function getStatistics(appToken, userId, startTime, endTime) {
     for (const host of STATISTICS_HOSTS) {
         const url = `https://${host}${path}`;
         try {
-            const response = await fetchWithRetry(url, { method: 'GET', headers });
+            const response = await fetchWithRetry(url, {
+                method: 'GET',
+                headers,
+                maxRetries: STATS_ATTEMPTS
+            });
             if (!response.ok) {
                 throw new Error(`Stats request failed: ${response.status} (${host})`);
             }
-            return await response.json();
+            const data = await response.json();
+            console.error(`[stats] data served from ${host} (${data.data ? data.data.length : 0} apps)`);
+            return data;
         } catch (e) {
             lastError = e;
             console.error(`getStatistics failed on ${host}: ${e.message}`);
