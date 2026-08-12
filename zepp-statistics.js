@@ -246,20 +246,42 @@ async function getAccessToken(authCode) {
     return data.token_info.app_token;
 }
 
-async function getStatistics(appToken, userId, startTime, endTime) {
-    const url = `https://api-mifit-cn3.zepp.com/market/open/statistics?userid=${userId}&page=1&per_page=50&type=4&start_time=${startTime}&end_time=${endTime}`;
-    
-    const response = await fetchWithRetry(url, {
-        method: 'GET',
-        headers: {
-            'accept': 'application/json, text/plain, */*',
-            'apptoken': appToken,
-            'Referer': 'https://console.zepp.com/'
-        }
-    });
+// Region hosts for the Zepp market/statistics API. -cn3 (China) is primary
+// because the account historically served from there, but egress from the
+// DigitalOcean sandbox to Chinese hosts is flaky/geo-blocked at times, so we
+// fall back across the regional hosts until one responds.
+const STATISTICS_HOSTS = [
+    'api-mifit-cn3.zepp.com',
+    'api-mifit-cn.zepp.com',
+    'api-mifit-cn2.zepp.com',
+    'api-mifit-us.zepp.com',
+    'api-mifit.zepp.com'
+];
 
-    if (!response.ok) throw new Error(`Stats request failed: ${response.status}`);
-    return await response.json();
+async function getStatistics(appToken, userId, startTime, endTime) {
+    const path = `/market/open/statistics?userid=${userId}&page=1&per_page=50&type=4&start_time=${startTime}&end_time=${endTime}`;
+    const headers = {
+        'accept': 'application/json, text/plain, */*',
+        'apptoken': appToken,
+        'Referer': 'https://console.zepp.com/'
+    };
+
+    let lastError;
+    for (const host of STATISTICS_HOSTS) {
+        const url = `https://${host}${path}`;
+        try {
+            const response = await fetchWithRetry(url, { method: 'GET', headers });
+            if (!response.ok) {
+                throw new Error(`Stats request failed: ${response.status} (${host})`);
+            }
+            return await response.json();
+        } catch (e) {
+            lastError = e;
+            console.error(`getStatistics failed on ${host}: ${e.message}`);
+        }
+    }
+
+    throw lastError;
 }
 
 function formatStatisticsMessage(data, startDate, endDate) {
