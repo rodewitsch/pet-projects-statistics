@@ -19,7 +19,7 @@ All functions share the same shape: they export `main(args)` and return an HTTP 
 - **Input parameters**: passed via `args` (when the function is invoked) or via `process.env` environment variables. `args` takes precedence.
 - **Telegram auth**: a bot token in `TELEGRAM_BOT_TOKEN` and a chat ID in `TELEGRAM_CHAT_ID`.
 - **Time**: all timestamps are generated in Minsk time (UTC+3) and labeled `MSK`.
-- **Number formatting**: large numbers are shortened — `1,000,000` → `1.0M`, `10,000` → `10.0K`.
+- **Number formatting**: in the Chrome Web Store and NPM reports large numbers are shortened — `1,000,000` → `1.0M`, `10,000` → `10.0K`. The Zepp report prints exact numbers with comma grouping instead (`1,000`, `1,234,567`).
 - **Error handling**: on failure the function sends a `❌ ... error: <message>` message to Telegram and returns `statusCode: 500`.
 
 ---
@@ -199,6 +199,7 @@ Authenticates against a Zepp (Huami) account and collects statistics for smartwa
 - Summary: total number of apps and total download count
 - Per app: name, downloads, publish date, `🆓 Free` / `💰 Paid` status, number of countries
 - Update timestamp (Minsk, UTC+3)
+- Download counts are printed in full with comma grouping (`996`, `1,000`) — never abbreviated as `1.0K`
 - Markdown special characters are escaped (`escapeMarkdown`)
 
 ### Example message
@@ -212,18 +213,18 @@ What the message looks like in the chat (MarkdownV2 is rendered by Telegram, so 
 
 📊 Summary
 ├ Total apps: 5
-└ Total downloads: 12.5K
+└ Total downloads: 12,540
 
 📈 Apps Performance
 
 1. Step Counter Pro
-├ 📥 Downloads: 8.2K
+├ 📥 Downloads: 8,214
 ├ 📅 Published: 12.03.2026
 ├ 🆓 Free
 └ 🌍 12 countries
 
 2. Heart Rate Monitor
-├ 📥 Downloads: 3.1K
+├ 📥 Downloads: 3,126
 ├ 📅 Published: 27.01.2026
 ├ 💰 Paid
 └ 🌍 8 countries
@@ -232,11 +233,12 @@ What the message looks like in the chat (MarkdownV2 is rendered by Telegram, so 
 ⏰ Updated: 05.08.2026, 14:30 MSK
 ```
 
-> In the chat the header, "Summary", "Apps Performance", the app names and the download counts appear in **bold**. Under the hood the message is sent with `parse_mode: MarkdownV2`, so special characters such as `.`, `-` and `*` are escaped with backslashes (e.g. `05\.08\.2026`) and `*text*` marks bold — Telegram strips the backslashes and renders the formatting, so they are never shown in the chat.
+> In the chat the header, "Summary", "Apps Performance", the app names and the download counts appear in **bold**. Under the hood the message is sent with `parse_mode: MarkdownV2`, so special characters such as `.`, `-` and `*` are escaped with backslashes (e.g. `05\.08\.2026`) and `*text*` marks bold — Telegram strips the backslashes and renders the formatting, so they are never shown in the chat. Every interpolated value (including the download counts) goes through `escapeMarkdown()`, because MarkdownV2 rejects the entire message with `400 can't parse entities` on a single unescaped reserved character.
 
 ### Sending notes
 
-- Primary format is `MarkdownV2`. If rendering fails, the message is automatically re-sent as plain text (`sendTelegramMessageSimple`) with all formatting characters stripped.
+- Primary format is `MarkdownV2`. If rendering fails (e.g. an unescaped reserved character), the message is automatically re-sent as plain text via `sendTelegramMessageSimple`.
+- The plain-text fallback only removes the MarkdownV2 syntax — escape backslashes and the formatting delimiters (`*`, `_`, `` ` ``, `~`, `|`). Content characters such as `.`, `-` and `!` are preserved, so dates and numbers stay readable in the fallback message.
 
 ### Response
 

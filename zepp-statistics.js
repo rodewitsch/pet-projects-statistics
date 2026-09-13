@@ -309,7 +309,7 @@ function formatStatisticsMessage(data, startDate, endDate) {
         
         message += `📊 *Summary*\n`;
         message += `├ Total apps: ${totalApps}\n`;
-        message += `└ Total downloads: ${formatNumber(totalDownloads)}\n\n`;
+        message += `└ Total downloads: ${escapeMarkdown(formatExactNumber(totalDownloads))}\n\n`;
         
         message += `📈 *Apps Performance*\n`;
         
@@ -321,7 +321,7 @@ function formatStatisticsMessage(data, startDate, endDate) {
             const priceLabel = isFree ? '🆓 Free' : '💰 Paid';
             
             message += `\n*${index + 1}\\. ${name}*\n`;
-            message += `├ 📥 Downloads: *${formatNumber(app.downloads || 0)}*\n`;
+            message += `├ 📥 Downloads: *${escapeMarkdown(formatExactNumber(app.downloads || 0))}*\n`;
             if (onlineDate !== 'Unknown') {
                 message += `├ 📅 Published: ${escapeMarkdown(onlineDate)}\n`;
             }
@@ -381,13 +381,15 @@ function escapeMarkdown(text) {
     return text.toString().replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
-function formatNumber(num) {
-    if (num >= 1000000) {
-        return (num / 1000000).toFixed(1) + 'M';
-    } else if (num >= 1000) {
-        return (num / 1000).toFixed(1) + 'K';
-    }
-    return num.toString();
+// Exact download counts - no K/M abbreviation: 1000 -> "1,000", 1234567 -> "1,234,567".
+// A comma is NOT a MarkdownV2 reserved character, but the value is still passed
+// through escapeMarkdown() at the call sites as a safety net. The old abbreviation
+// ("1.0K") contained a dot, which MarkdownV2 rejects unless escaped, so Telegram
+// refused the whole message and the plain-text fallback mangled it instead.
+function formatExactNumber(num) {
+    const value = Number(num);
+    if (!Number.isFinite(value)) return '0';
+    return Math.trunc(value).toLocaleString('en-US');
 }
 
 async function sendTelegramMessage(botToken, chatId, text) {
@@ -416,12 +418,17 @@ async function sendTelegramMessage(botToken, chatId, text) {
     }
 }
 
+// The fallback request is sent WITHOUT parse_mode, so only the MarkdownV2 syntax
+// has to go - never the content. The previous version also stripped '.', '-', '!'
+// and friends, which mangled dates ("16.03.2026 - 12.09.2026" became
+// "17032026  13092026") and turned "1.0K" into "10K" in the chat.
+function toPlainText(text) {
+    // Escaped character -> keep the character itself; formatting delimiter -> drop it.
+    return String(text).replace(/\\(.)|[*_`~|]/g, (match, escaped) => escaped || '');
+}
+
 async function sendTelegramMessageSimple(botToken, chatId, text) {
-    const plainText = text
-        .replace(/\*/g, '')
-        .replace(/`/g, '')
-        .replace(/\\/g, '')
-        .replace(/[_\[\]()~>#+\-=|{}.!]/g, '');
+    const plainText = toPlainText(text);
     
     const response = await fetchWithRetry(`https://api.telegram.org/bot${botToken}/sendMessage`, {
         method: 'POST',
