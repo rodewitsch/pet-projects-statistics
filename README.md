@@ -8,7 +8,7 @@ Serverless functions (DigitalOcean Functions) that collect statistics for pet pr
 |------|-------------|------------------|
 | `chrome-web-store-statistics.js` | Chrome Web Store | Users, rating, and review count of Chrome extensions |
 | `npm-statistics.js` | npm registry | npm package downloads (total / weekly / monthly) |
-| `zepp-statistics.js` | Zepp / Huami API | Statistics for Zepp smartwatch apps |
+| `zepp-statistics.js` | Zepp / Huami API | Statistics for Zepp smartwatch apps and watchfaces |
 
 All functions share the same shape: they export `main(args)` and return an HTTP response object in the DigitalOcean Functions format.
 
@@ -173,9 +173,9 @@ What the message looks like in the chat (HTML is rendered by Telegram, so no tag
 
 ---
 
-## 3. Zepp Apps Statistics — `zepp-statistics.js`
+## 3. Zepp Statistics — `zepp-statistics.js`
 
-Authenticates against a Zepp (Huami) account and collects statistics for smartwatch apps over the last 180 days: download count, publish date, price (free/paid), and number of countries. Apps are sorted by download count.
+Authenticates against a Zepp (Huami) account and collects statistics over the last 180 days for both **smartwatch apps** and **watchfaces**: download count, publish date, price (free/paid), and number of countries. Each catalogue gets its own section in the report.
 
 ### Parameters
 
@@ -186,18 +186,38 @@ Authenticates against a Zepp (Huami) account and collects statistics for smartwa
 | `ZEPP_EMAIL` | `ZEPP_EMAIL` | ⚠️ | Zepp account email |
 | `ZEPP_PASSWORD` | `ZEPP_PASSWORD` | ⚠️ | Zepp account password |
 | `USER_ID` | `USER_ID` | ⚠️ | Zepp user ID |
+| `ZEPP_WATCHFACE_TYPE` | `ZEPP_WATCHFACE_TYPE` | ➖ | Pins the `type` used for the watchface statistics and skips the auto-probe. Leave unset to let the function discover it |
 
 ### Authentication flow
 
 1. `getAuthorizationCode(email, password)` — requests `api-user.huami.com` to obtain an authorization code.
 2. `getAccessToken(authCode)` — exchanges the code for an `app_token` via `account.huami.com/v2/client/login`.
-3. `getStatistics(appToken, userId, start, end)` — requests statistics for the period (default 180 days) from `api-mifit-cn3.zepp.com/market/open/statistics`.
+3. `getStatistics(appToken, userId, start, end, type)` — requests statistics for the period (default 180 days) from `market/open/statistics`. The region host list is tried in order, and the first host that answers is pinned for the rest of the run so the probe below stays fast.
+4. `detectWatchfaceStatistics(...)` — finds the `type` that returns watchfaces (see below).
+
+### Watchface statistics
+
+`type=4` returns the apps. The value that returns watchfaces is not documented anywhere and could not be recovered from the Zepp console bundle (the console simply forwards whatever query parameters its Statistics page supplies), so the function discovers it at runtime:
+
+- Candidates `1, 2, 3, 5, 6` are requested in order.
+- A candidate that fails, returns no items, or returns exactly the app catalogue is skipped. A candidate that returns both catalogues is accepted, but the app rows are filtered out so nothing is rendered twice.
+- The first acceptable response is reused as the final watchface data, so the probe adds one request per candidate and never re-fetches the winner.
+- Every candidate is logged, so the winning value is visible in the function logs:
+
+```
+[watchface] type=1 -> 0 items
+[watchface] type=3 -> same catalogue as apps, skipping
+[watchface] watchface statistics served by type=5
+```
+
+Once the logs reveal the value, set `ZEPP_WATCHFACE_TYPE` to it — the probe is then skipped and exactly one request is made. If no candidate matches, the watchface section is omitted and the app report is still sent.
 
 ### Report format (Telegram MarkdownV2)
 
-- Header `⌚️ Zepp Apps Statistics` and the period (dates in `DD.MM.YYYY` format)
-- Summary: total number of apps and total download count
-- Per app: name, downloads, publish date, `🆓 Free` / `💰 Paid` status, number of countries
+- Header `⌚️ Zepp Statistics` and the period (dates in `DD.MM.YYYY` format)
+- Summary: number of apps and their download total, plus the same for watchfaces when they are available
+- Sections `📈 Apps Performance` and `⌚️ Watchfaces Performance`
+- Per item: name, downloads, publish date, `🆓 Free` / `💰 Paid` status, number of countries
 - Update timestamp (Minsk, UTC+3)
 - Download counts are printed in full with comma grouping (`996`, `1,000`) — never abbreviated as `1.0K`
 - Markdown special characters are escaped (`escapeMarkdown`)
@@ -207,13 +227,15 @@ Authenticates against a Zepp (Huami) account and collects statistics for smartwa
 What the message looks like in the chat (MarkdownV2 is rendered by Telegram, so the escape backslashes are invisible):
 
 ```
-⌚️ Zepp Apps Statistics
+⌚️ Zepp Statistics
 📅 05.08.2025 - 05.08.2026
 ━━━━━━━━━━━━━━━━━
 
 📊 Summary
-├ Total apps: 5
-└ Total downloads: 12,540
+├ Apps: 5
+├ App downloads: 12,540
+├ Watchfaces: 1
+└ Watchface downloads: 1,203,456
 
 📈 Apps Performance
 
@@ -229,6 +251,14 @@ What the message looks like in the chat (MarkdownV2 is rendered by Telegram, so 
 ├ 💰 Paid
 └ 🌍 8 countries
 
+⌚️ Watchfaces Performance
+
+1. Neon Grid
+├ 📥 Downloads: 1,203,456
+├ 📅 Published: 01.05.2026
+├ 🆓 Free
+└ 🌍 24 countries
+
 ━━━━━━━━━━━━━━━━━
 ⏰ Updated: 05.08.2026, 14:30 MSK
 ```
@@ -242,7 +272,7 @@ What the message looks like in the chat (MarkdownV2 is rendered by Telegram, so 
 
 ### Response
 
-- Success: `200` with `{ success: true }`
+- Success: `200` with `{ success: true, watchfaceType: 5 }` — `watchfaceType` is `null` when no candidate matched
 - Validation error: `400` if the token or chat ID is missing
 - Execution error: `500`
 
@@ -346,5 +376,7 @@ All three files share common helper functions:
 | `formatDate(date)` | zepp | Date as `YYYY-MM-DD` (for the API) |
 | `formatMinskDateDisplay(date)` | zepp | Date as `DD.MM.YYYY` in Minsk time |
 | `escapeMarkdown(text)` | zepp | Escapes MarkdownV2 special characters |
+| `extractItems(response)` | zepp | Normalizes a statistics response to `{ total, items }` |
+| `detectWatchfaceStatistics(...)` | zepp | Auto-probes the watchface `type`, or uses `ZEPP_WATCHFACE_TYPE` |
 | `sendTelegramMessage(...)` | all | Sends a message to Telegram |
 | `sendTelegramMessageSimple(...)` | npm, zepp | Sends plain text (fallback) |

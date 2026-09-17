@@ -6,6 +6,9 @@ async function main(args) {
     const ZEPP_EMAIL = args.ZEPP_EMAIL || process.env.ZEPP_EMAIL;
     const ZEPP_PASSWORD = args.ZEPP_PASSWORD || process.env.ZEPP_PASSWORD;
     const USER_ID = args.USER_ID || process.env.USER_ID;
+    // Optional pin for the watchface statistics `type`. When set, the auto-probe
+    // is skipped (see detectWatchfaceStatistics).
+    const WATCHFACE_TYPE = args.ZEPP_WATCHFACE_TYPE || process.env.ZEPP_WATCHFACE_TYPE;
 
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
         return { statusCode: 400, body: JSON.stringify({ error: 'Missing credentials' }) };
@@ -14,21 +17,41 @@ async function main(args) {
     try {
         const accessCode = await getAuthorizationCode(ZEPP_EMAIL, ZEPP_PASSWORD);
         const tokenInfo = await getAccessToken(accessCode);
-        
+
         const endDate = new Date();
         const startDate = new Date();
         startDate.setDate(startDate.getDate() - 180);
-        
+
         const startTime = formatDate(startDate);
         const endTime = formatDate(endDate);
-        
-        const statisticsData = await getStatistics(tokenInfo, USER_ID, startTime, endTime);
-        const message = formatStatisticsMessage(statisticsData, startDate, endDate);
+
+        const apps = extractItems(
+            await getStatistics(tokenInfo, USER_ID, startTime, endTime, STATS_TYPE_APP)
+        );
+
+        // Watchface statistics live behind an undocumented `type` value, so it is
+        // probed (or pinned via ZEPP_WATCHFACE_TYPE). A probe failure must never
+        // break the report - the app section is still worth sending.
+        let watchfaces = null;
+        let watchfaceType = null;
+        try {
+            const detected = await detectWatchfaceStatistics(
+                tokenInfo, USER_ID, startTime, endTime, apps.items, WATCHFACE_TYPE
+            );
+            if (detected) {
+                watchfaces = extractItems(detected.response);
+                watchfaceType = detected.type;
+            }
+        } catch (e) {
+            console.error(`[watchface] detection failed: ${e.message}`);
+        }
+
+        const message = formatStatisticsMessage(apps, watchfaces, startDate, endDate);
         await sendTelegramMessage(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, message);
 
         return {
             statusCode: 200,
-            body: JSON.stringify({ success: true })
+            body: JSON.stringify({ success: true, watchfaceType: watchfaceType })
         };
 
     } catch (error) {
@@ -39,7 +62,7 @@ async function main(args) {
             await sendTelegramMessageSimple(
                 TELEGRAM_BOT_TOKEN, 
                 TELEGRAM_CHAT_ID, 
-                `❌ Zepp apps stats error: ${error.message}`
+                `❌ Zepp stats error: ${error.message}`
             );
         } catch (e) {
             console.error('Telegram error:', e);
@@ -262,17 +285,40 @@ const STATISTICS_HOSTS = [
 // Statistics host is already the primary data source; keep per-host calls fast
 // so a stack of dead hosts doesn't burn the whole 60s function budget.
 const STATS_ATTEMPTS = 2;
+const STATS_PER_PAGE = 50;
 
-async function getStatistics(appToken, userId, startTime, endTime) {
-    const path = `/market/open/statistics?userid=${userId}&page=1&per_page=50&type=4&start_time=${startTime}&end_time=${endTime}`;
+// The `type` query param selects which catalogue the statistics cover.
+// 4 = Zepp OS apps (verified against the live account). The watchface value is
+// not documented anywhere and could not be derived from the console bundle, so
+// it is probed at runtime (see detectWatchfaceStatistics).
+const STATS_TYPE_APP = 4;
+const WATCHFACE_TYPE_CANDIDATES = [1, 2, 3, 5, 6];
+
+// Probing multiplies the number of stats calls per run, so the first host that
+// answers is pinned for the rest of the invocation. Without this every probe
+// would walk the whole STATISTICS_HOSTS list, including the China hosts that
+// time out from the DigitalOcean sandbox.
+let preferredStatsHost = null;
+
+function buildStatisticsPath(userId, type, startTime, endTime, perPage) {
+    return `/market/open/statistics?userid=${userId}&page=1&per_page=${perPage}&type=${type}&start_time=${startTime}&end_time=${endTime}`;
+}
+
+async function getStatistics(appToken, userId, startTime, endTime, type, perPage) {
+    const path = buildStatisticsPath(userId, type, startTime, endTime, perPage || STATS_PER_PAGE);
     const headers = {
         'accept': 'application/json, text/plain, */*',
         'apptoken': appToken,
         'Referer': 'https://console.zepp.com/'
     };
 
+    // Pinned host first, then the remaining region list.
+    const hosts = preferredStatsHost
+        ? [preferredStatsHost].concat(STATISTICS_HOSTS.filter((host) => host !== preferredStatsHost))
+        : STATISTICS_HOSTS;
+
     let lastError;
-    for (const host of STATISTICS_HOSTS) {
+    for (const host of hosts) {
         const url = `https://${host}${path}`;
         try {
             const response = await fetchWithRetry(url, {
@@ -284,63 +330,171 @@ async function getStatistics(appToken, userId, startTime, endTime) {
                 throw new Error(`Stats request failed: ${response.status} (${host})`);
             }
             const data = await response.json();
-            console.error(`[stats] data served from ${host} (${data.data ? data.data.length : 0} apps)`);
+            const count = data && Array.isArray(data.data) ? data.data.length : 0;
+            preferredStatsHost = host;
+            console.error(`[stats] type=${type} served from ${host} (${count} items)`);
             return data;
         } catch (e) {
             lastError = e;
-            console.error(`getStatistics failed on ${host}: ${e.message}`);
+            if (preferredStatsHost === host) preferredStatsHost = null;
+            console.error(`getStatistics (type=${type}) failed on ${host}: ${e.message}`);
         }
     }
 
     throw lastError;
 }
 
-function formatStatisticsMessage(data, startDate, endDate) {
+function extractItems(response) {
+    const items = response && Array.isArray(response.data) ? response.data : [];
+    const total = response && response.total ? response.total : items.length;
+    return { total: total, items: items };
+}
+
+// App rows and watchface rows are not guaranteed to share field names, so every
+// known spelling is accepted instead of trusting a single one.
+function getItemName(item) {
+    return item.name || item.app_name || item.watch_name || 'Unknown';
+}
+
+function getItemDownloads(item) {
+    return item.downloads || item.download_count || item.download_num || 0;
+}
+
+function getItemOnlineDate(item) {
+    return item.online || item.online_time || item.release_time;
+}
+
+function isFreeItem(item) {
+    const value = item.is_free;
+    return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function countItemCountries(item) {
+    if (!item.country) return 0;
+    return item.country.split(',').length;
+}
+
+function sumDownloads(stats) {
+    if (!stats || !Array.isArray(stats.items)) return 0;
+    return stats.items.reduce((sum, item) => sum + getItemDownloads(item), 0);
+}
+
+function itemIdentity(item, index) {
+    if (!item) return `#${index}`;
+    return String(item.id || item.app_id || item.watchface_id || item.name || `#${index}`);
+}
+
+/**
+ * Finds the statistics `type` that returns watchfaces.
+ *
+ * The endpoint echoes whichever catalogue the `type` selects, so a probe answer is
+ * rejected when every one of its items is already in the app list (the same
+ * catalogue can't be the watchface one). The probe uses the real page size, so the
+ * winning response is reused as the final data and no second call is made.
+ */
+async function detectWatchfaceStatistics(appToken, userId, startTime, endTime, appItems, pinnedType) {
+    const appIdentities = new Set((appItems || []).map((item, index) => itemIdentity(item, index)));
+
+    if (pinnedType) {
+        const response = await getStatistics(appToken, userId, startTime, endTime, pinnedType);
+        const items = extractItems(response).items;
+        console.error(`[watchface] pinned type=${pinnedType} -> ${items.length} items`);
+        return items.length > 0 ? { type: Number(pinnedType), response: response } : null;
+    }
+
+    for (const type of WATCHFACE_TYPE_CANDIDATES) {
+        let response;
+        try {
+            response = await getStatistics(appToken, userId, startTime, endTime, type);
+        } catch (e) {
+            console.error(`[watchface] type=${type} -> request failed: ${e.message}`);
+            continue;
+        }
+
+        const items = extractItems(response).items;
+        console.error(`[watchface] type=${type} -> ${items.length} items`);
+
+        if (items.length === 0) continue;
+
+        if (items.every((item, index) => appIdentities.has(itemIdentity(item, index)))) {
+            console.error(`[watchface] type=${type} -> same catalogue as apps, skipping`);
+            continue;
+        }
+
+        // A type that ignores the filter would return both catalogues, so app rows
+        // are dropped instead of being rendered twice.
+        const watchfaceOnly = items.filter((item, index) => !appIdentities.has(itemIdentity(item, index)));
+        if (watchfaceOnly.length === 0) continue;
+
+        console.error(`[watchface] watchface statistics served by type=${type}`);
+        return {
+            type: type,
+            response: { ...response, total: watchfaceOnly.length, data: watchfaceOnly }
+        };
+    }
+
+    console.error('[watchface] no candidate type returned watchface data');
+    return null;
+}
+
+function formatItemBlock(item, index) {
+    const name = escapeMarkdown(getItemName(item));
+    const onlineDate = formatOnlineDate(getItemOnlineDate(item));
+    const priceLabel = isFreeItem(item) ? '🆓 Free' : '💰 Paid';
+    const countriesCount = countItemCountries(item);
+
+    let block = `\n*${index + 1}\\. ${name}*\n`;
+    block += `├ 📥 Downloads: *${escapeMarkdown(formatExactNumber(getItemDownloads(item)))}*\n`;
+    if (onlineDate !== 'Unknown') {
+        block += `├ 📅 Published: ${escapeMarkdown(onlineDate)}\n`;
+    }
+    block += `├ ${priceLabel}\n`;
+    if (countriesCount > 0) {
+        block += `└ 🌍 ${countriesCount} countries\n`;
+    }
+    return block;
+}
+
+function formatSection(heading, label, stats) {
+    if (!stats || stats.items.length === 0) {
+        return `❌ No ${label} data for this period\n`;
+    }
+
+    let section = `${heading}\n`;
+    stats.items.forEach((item, index) => {
+        section += formatItemBlock(item, index);
+    });
+    return section;
+}
+
+function formatStatisticsMessage(apps, watchfaces, startDate, endDate) {
     const startFormatted = formatMinskDateDisplay(startDate);
     const endFormatted = formatMinskDateDisplay(endDate);
-    
-    let message = '⌚️ *Zepp Apps Statistics*\n';
+
+    let message = '⌚️ *Zepp Statistics*\n';
     message += `📅 ${escapeMarkdown(startFormatted)} \\- ${escapeMarkdown(endFormatted)}\n`;
     message += '━━━━━━━━━━━━━━━━━\n\n';
 
-    if (data && data.data && data.data.length > 0) {
-        const totalApps = data.total || data.data.length;
-        const totalDownloads = data.data.reduce((sum, app) => sum + (app.downloads || 0), 0);
-        
-        message += `📊 *Summary*\n`;
-        message += `├ Total apps: ${totalApps}\n`;
-        message += `└ Total downloads: ${escapeMarkdown(formatExactNumber(totalDownloads))}\n\n`;
-        
-        message += `📈 *Apps Performance*\n`;
-        
-        data.data.forEach((app, index) => {
-            const name = escapeMarkdown(app.name || 'Unknown');
-            const onlineDate = formatOnlineDate(app.online);
-            
-            const isFree = app.is_free === true || app.is_free === 'true' || app.is_free === 1;
-            const priceLabel = isFree ? '🆓 Free' : '💰 Paid';
-            
-            message += `\n*${index + 1}\\. ${name}*\n`;
-            message += `├ 📥 Downloads: *${escapeMarkdown(formatExactNumber(app.downloads || 0))}*\n`;
-            if (onlineDate !== 'Unknown') {
-                message += `├ 📅 Published: ${escapeMarkdown(onlineDate)}\n`;
-            }
-            message += `├ ${priceLabel}\n`;
-            
-            if (app.country) {
-                const countriesCount = app.country.split(',').length;
-                message += `└ 🌍 ${countriesCount} countries\n`;
-            }
-        });
-        
+    message += `📊 *Summary*\n`;
+    message += `├ Apps: ${apps.total}\n`;
+    if (watchfaces) {
+        message += `├ App downloads: ${escapeMarkdown(formatExactNumber(sumDownloads(apps)))}\n`;
+        message += `├ Watchfaces: ${watchfaces.total}\n`;
+        message += `└ Watchface downloads: ${escapeMarkdown(formatExactNumber(sumDownloads(watchfaces)))}\n`;
     } else {
-        message += '❌ No apps data for this period\n';
+        message += `└ App downloads: ${escapeMarkdown(formatExactNumber(sumDownloads(apps)))}\n`;
+    }
+    message += '\n';
+
+    message += formatSection('📈 *Apps Performance*', 'apps', apps) + '\n';
+    if (watchfaces && watchfaces.items.length > 0) {
+        message += formatSection('⌚️ *Watchfaces Performance*', 'watchfaces', watchfaces) + '\n';
     }
 
     const minskNow = getMinskTime();
     const updateTime = `${String(minskNow.getUTCDate()).padStart(2, '0')}.${String(minskNow.getUTCMonth() + 1).padStart(2, '0')}.${minskNow.getUTCFullYear()}, ${String(minskNow.getUTCHours()).padStart(2, '0')}:${String(minskNow.getUTCMinutes()).padStart(2, '0')}`;
-    
-    message += '\n━━━━━━━━━━━━━━━━━';
+
+    message += '━━━━━━━━━━━━━━━━━';
     message += `\n⏰ Updated: ${escapeMarkdown(updateTime)} MSK`;
 
     return message;
